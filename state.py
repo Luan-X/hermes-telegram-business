@@ -10,7 +10,11 @@ Hermes' core ``state.db`` schema:
 
   business_drafts — pending owner-approval drafts. Created when a customer
     messages a connected chat and the manager produces a candidate reply;
-    resolved when the owner taps Send / Edit / Discard or when it expires.
+    resolved when the owner taps Send / Edit / Discard, a risk hold blocks it,
+    or when it expires.
+
+  business_chat_controls — durable per-chat screening and enforcement state.
+  business_risk_events — append-only screening and owner-action audit trail.
 """
 
 from __future__ import annotations
@@ -56,6 +60,44 @@ CREATE TABLE IF NOT EXISTS business_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_biz_drafts_conn_customer
     ON business_drafts(connection_id, customer_chat_id, status);
+
+CREATE TABLE IF NOT EXISTS business_chat_controls (
+    connection_id TEXT NOT NULL,
+    customer_chat_id TEXT NOT NULL,
+    screening_state TEXT NOT NULL DEFAULT 'active',
+    enforcement_state TEXT NOT NULL DEFAULT 'none',
+    blocked_until REAL,
+    reason_code TEXT,
+    source TEXT,
+    last_risk_event_id INTEGER,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (connection_id, customer_chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_biz_controls_enforcement
+    ON business_chat_controls(enforcement_state, blocked_until);
+
+CREATE TABLE IF NOT EXISTS business_risk_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    customer_chat_id TEXT NOT NULL,
+    customer_msg_id TEXT,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    risk_score REAL NOT NULL,
+    confidence REAL NOT NULL,
+    rule_hits TEXT NOT NULL DEFAULT '[]',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    message_excerpt TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    actor TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_biz_risk_conn_chat
+    ON business_risk_events(connection_id, customer_chat_id, created_at);
 """
 
 
@@ -184,6 +226,198 @@ class BusinessStateDB:
             self._conn.commit()
 
     # ------------------------------------------------------------------
+    # Per-chat screening and enforcement state.
+    # ------------------------------------------------------------------
+
+    def get_telegram_business_chat_control(
+        self, connection_id: str, customer_chat_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM business_chat_controls "
+                "WHERE connection_id = ? AND customer_chat_id = ?",
+                (str(connection_id), str(customer_chat_id)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_telegram_business_chat_control(
+        self,
+        connection_id: str,
+        customer_chat_id: str,
+        *,
+        screening_state: Optional[str] = None,
+        enforcement_state: Optional[str] = None,
+        blocked_until: Optional[float] = None,
+        reason_code: Optional[str] = None,
+        source: Optional[str] = None,
+        last_risk_event_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        allowed_screening = {"active", "risk_hold", "manual_pause"}
+        allowed_enforcement = {"none", "temp_block", "blocked", "allowlisted"}
+        if screening_state is not None and screening_state not in allowed_screening:
+            raise ValueError(f"invalid screening state: {screening_state}")
+        if enforcement_state is not None and enforcement_state not in allowed_enforcement:
+            raise ValueError(f"invalid enforcement state: {enforcement_state}")
+        current = self.get_telegram_business_chat_control(connection_id, customer_chat_id)
+        values = {
+            "screening_state": screening_state or (current or {}).get("screening_state", "active"),
+            "enforcement_state": enforcement_state or (current or {}).get("enforcement_state", "none"),
+            "blocked_until": blocked_until if blocked_until is not None else (current or {}).get("blocked_until"),
+            "reason_code": reason_code if reason_code is not None else (current or {}).get("reason_code"),
+            "source": source if source is not None else (current or {}).get("source"),
+            "last_risk_event_id": (
+                last_risk_event_id if last_risk_event_id is not None
+                else (current or {}).get("last_risk_event_id")
+            ),
+        }
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO business_chat_controls (
+                    connection_id, customer_chat_id, screening_state,
+                    enforcement_state, blocked_until, reason_code, source,
+                    last_risk_event_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id, customer_chat_id) DO UPDATE SET
+                    screening_state = excluded.screening_state,
+                    enforcement_state = excluded.enforcement_state,
+                    blocked_until = excluded.blocked_until,
+                    reason_code = excluded.reason_code,
+                    source = excluded.source,
+                    last_risk_event_id = excluded.last_risk_event_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(connection_id), str(customer_chat_id), values["screening_state"],
+                    values["enforcement_state"], values["blocked_until"],
+                    values["reason_code"], values["source"],
+                    values["last_risk_event_id"], now,
+                ),
+            )
+            self._conn.commit()
+        return self.get_telegram_business_chat_control(connection_id, customer_chat_id) or {}
+
+    def list_telegram_business_chat_controls(
+        self, *, connection_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM business_chat_controls"
+        params: List[Any] = []
+        if connection_ids:
+            marks = ",".join("?" for _ in connection_ids)
+            sql += f" WHERE connection_id IN ({marks})"
+            params.extend(str(value) for value in connection_ids)
+        sql += " ORDER BY updated_at DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_telegram_business_chat_control(
+        self, connection_id: str, customer_chat_id: str, *, actor: str = "owner"
+    ) -> Optional[Dict[str, Any]]:
+        """Return a chat to active processing and clear local enforcement."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE business_chat_controls SET screening_state = 'active', "
+                "enforcement_state = 'none', blocked_until = NULL, "
+                "reason_code = NULL, source = ?, updated_at = ? "
+                "WHERE connection_id = ? AND customer_chat_id = ?",
+                (str(actor), time.time(), str(connection_id), str(customer_chat_id)),
+            )
+            self._conn.commit()
+        return self.get_telegram_business_chat_control(connection_id, customer_chat_id)
+
+    def create_telegram_business_risk_event(
+        self,
+        *,
+        connection_id: str,
+        customer_chat_id: str,
+        customer_msg_id: Optional[str],
+        category: str,
+        severity: str,
+        risk_score: float,
+        confidence: float,
+        rule_hits: List[str],
+        result_json: Dict[str, Any],
+        message_excerpt: str,
+        content_hash: str,
+        decision: str,
+        actor: Optional[str] = None,
+    ) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO business_risk_events (
+                    connection_id, customer_chat_id, customer_msg_id,
+                    category, severity, risk_score, confidence, rule_hits,
+                    result_json, message_excerpt, content_hash, decision,
+                    actor, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(connection_id), str(customer_chat_id),
+                    str(customer_msg_id) if customer_msg_id is not None else None,
+                    str(category), str(severity), float(risk_score), float(confidence),
+                    json.dumps(rule_hits or [], ensure_ascii=False),
+                    json.dumps(result_json or {}, ensure_ascii=False),
+                    str(message_excerpt or "")[:600], str(content_hash), str(decision),
+                    actor, now,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_telegram_business_risk_events(
+        self, connection_id: str, customer_chat_id: str, *, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM business_risk_events "
+                "WHERE connection_id = ? AND customer_chat_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (str(connection_id), str(customer_chat_id), max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_telegram_business_risk_event(self, event_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM business_risk_events WHERE event_id = ?",
+                (int(event_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def resolve_telegram_business_risk_event(self, event_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE business_risk_events SET resolved_at = ? "
+                "WHERE event_id = ? AND resolved_at IS NULL",
+                (time.time(), int(event_id)),
+            )
+            self._conn.commit()
+
+    def set_telegram_business_risk_event_actor(self, event_id: int, actor: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE business_risk_events SET actor = ? WHERE event_id = ?",
+                (str(actor), int(event_id)),
+            )
+            self._conn.commit()
+
+    def block_pending_telegram_business_drafts(
+        self, connection_id: str, customer_chat_id: str
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE business_drafts SET status = 'risk_blocked', updated_at = ? "
+                "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
+                (time.time(), str(connection_id), str(customer_chat_id)),
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    # ------------------------------------------------------------------
     # Drafts
     # ------------------------------------------------------------------
 
@@ -206,6 +440,25 @@ class BusinessStateDB:
         """
         now = time.time()
         with self._lock:
+            control = self._conn.execute(
+                "SELECT screening_state, enforcement_state, blocked_until "
+                "FROM business_chat_controls WHERE connection_id = ? "
+                "AND customer_chat_id = ?",
+                (str(connection_id), str(customer_chat_id)),
+            ).fetchone()
+            if control is not None:
+                blocked_until = control["blocked_until"]
+                temp_active = (
+                    control["enforcement_state"] == "temp_block"
+                    and blocked_until is not None
+                    and float(blocked_until) > now
+                )
+                if (
+                    control["screening_state"] in {"risk_hold", "manual_pause"}
+                    or control["enforcement_state"] == "blocked"
+                    or temp_active
+                ):
+                    return 0
             self._conn.execute(
                 "UPDATE business_drafts SET status = 'superseded', updated_at = ? "
                 "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
@@ -260,7 +513,7 @@ class BusinessStateDB:
         Returns the prior row, or None if the draft no longer exists or was
         already resolved (so callbacks for stale buttons no-op safely).
         """
-        if status not in {"sent", "edited", "discarded", "expired"}:
+        if status not in {"sent", "edited", "discarded", "expired", "risk_blocked"}:
             raise ValueError(f"invalid business draft status: {status}")
         now = time.time()
         with self._lock:

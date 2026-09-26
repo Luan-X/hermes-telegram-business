@@ -1,10 +1,12 @@
 name: telegram-business
-version: 1.0.0
+version: 1.1.0
 description: >
   Observe-with-approval Telegram Business Mode (secretary bot). Drafts
   replies to incoming customer messages on a connected Telegram Business
   account and DMs them to the owner with [Send] [Edit] [Discard] inline
   buttons — nothing reaches the customer until the owner approves.
-  No auto-send exists, even when can_reply is granted.
+  No auto-send exists, even when can_reply is granted. Incoming messages are
+  screened for scams, phishing, advertising, and spam; owners can hold,
+  locally block, unblock, and allowlist customer chats.
 author: "Nous Research"
 homepage: https://github.com/NousResearch/hermes-telegram-business

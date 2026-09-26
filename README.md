@@ -28,6 +28,8 @@ Discard → dropped, the customer sees nothing
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
 - **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — new messages within the debounce window supersede the prior draft, one draft per coherent thought.
+- **Risk holds stop drafting** — keyword rules and the host LLM can pause a chat and invalidate pending drafts.
+- **Local block modes** — owners can temporarily block, permanently block, unblock, or allowlist a chat.
 
 ## Requirements
 
@@ -57,6 +59,10 @@ Restart the gateway (`hermes gateway restart`). Then:
 | `/biz` | status dashboard |
 | `/biz pause` / `/biz resume` | global drafting kill switch |
 | `/biz off <chat_id>` / `/biz on <chat_id>` | per-customer-chat mute |
+| `/biz block <chat_id>` / `/biz unblock <chat_id>` | local permanent block and release |
+| `/biz tempblock <chat_id> <minutes>` | local timed block |
+| `/biz allow <chat_id>` / `/biz unallow <chat_id>` | local allowlist controls |
+| `/biz risk list` | show risk-held and blocked chats |
 
 ## Configuration
 
@@ -69,6 +75,12 @@ plugins:
       debounce_seconds: 8        # coalesce typing bursts
       draft_ttl_hours: 24        # stale-draft expiry
       max_customer_text_chars: 4000
+      screening_enabled: true
+      screening_llm_enabled: true
+      risk_threshold: 0.65
+      risk_confidence_threshold: 0.60
+      temp_block_minutes: 1440
+      auto_temp_block: true
       owner_persona: >
         You are drafting replies for a freelance photographer.
         Friendly, brief, always suggest a concrete next step.
@@ -78,13 +90,14 @@ Drafting uses your active Hermes model through the host-owned plugin LLM surface
 
 ## State
 
-Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (two tables: connections + drafts). Hermes' core state is never touched. Delete the file to reset.
+Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (connections, drafts, per-chat controls, and risk events). Hermes' core state is never touched. Delete the file to reset.
 
 ## v1 limits
 
 - **Text only** — customer media (photos, voice, documents) is skipped; captions do trigger drafts.
 - **No conversation history** — each customer message is drafted in isolation. The Edit button absorbs the gap.
 - **No persona learning from edits** — your overrides go to the customer but don't train future drafts.
+- **Local blocking** — `block` prevents this plugin from drafting or sending for the chat. Telegram account-level blocking remains a separate client-side operation.
 
 ## Tests
 

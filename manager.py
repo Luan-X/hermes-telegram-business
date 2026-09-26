@@ -47,20 +47,32 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+try:
+    from .screening import ScreeningResult, combine_results, content_hash, scan_keywords
+except ImportError:  # pragma: no cover - bare-module plugin loading
+    from screening import ScreeningResult, combine_results, content_hash, scan_keywords
 
 logger = logging.getLogger(__name__)
 
 
-# Callback-data prefix for the inline buttons. Keep it short — Telegram
-# caps callback_data at 64 bytes.  Format: "bd:<choice>:<draft_id>".
+# Callback-data prefixes for the inline buttons. Keep them short — Telegram
+# caps callback_data at 64 bytes.
 CALLBACK_PREFIX = "bd:"
+RISK_CALLBACK_PREFIX = "br:"
 
 
 # Choice values rendered on the inline keyboard.
 CHOICE_SEND = "send"
 CHOICE_EDIT = "edit"
 CHOICE_DISCARD = "discard"
+
+RISK_RESUME = "resume"
+RISK_TEMP_BLOCK = "temp"
+RISK_BLOCK = "block"
+RISK_ALLOW = "allow"
 
 
 # Onboarding text the bot DMs the owner the first time a BusinessConnection
@@ -80,6 +92,7 @@ ONBOARDING_MESSAGE = (
     "  /biz pause       — pause drafting (you still see the messages)\n"
     "  /biz resume      — resume drafting\n"
     "  /biz off         — disable drafting for one chat (reply to that customer's draft)\n\n"
+    "Risk controls: /biz risk list · /biz block <chat_id> · /biz unblock <chat_id>\n\n"
     "I never auto-send. Every reply is yours to approve."
 )
 
@@ -120,6 +133,12 @@ class BusinessModeManager:
         debounce_seconds: float = 8.0,
         draft_ttl_hours: float = 24.0,
         max_customer_text_chars: int = 4000,
+        risk_classifier: Optional[Callable[[str], Awaitable[Any]]] = None,
+        screening_enabled: bool = True,
+        risk_threshold: float = 0.65,
+        risk_confidence_threshold: float = 0.60,
+        temp_block_seconds: float = 24.0 * 3600.0,
+        auto_temp_block: bool = True,
     ) -> None:
         self._db = session_db
         self._send = send_message
@@ -127,6 +146,12 @@ class BusinessModeManager:
         self._debounce_seconds = max(0.0, float(debounce_seconds))
         self._draft_ttl_seconds = max(60.0, float(draft_ttl_hours) * 3600.0)
         self._max_customer_text_chars = int(max_customer_text_chars)
+        self._risk_classifier = risk_classifier
+        self._screening_enabled = bool(screening_enabled)
+        self._risk_threshold = max(0.0, min(1.0, float(risk_threshold)))
+        self._risk_confidence_threshold = max(0.0, min(1.0, float(risk_confidence_threshold)))
+        self._temp_block_seconds = max(60.0, float(temp_block_seconds))
+        self._auto_temp_block = bool(auto_temp_block)
 
         # In-flight debounce tasks, keyed by (connection_id, customer_chat_id).
         # New customer messages reset the timer so a typing burst yields one draft.
@@ -222,6 +247,190 @@ class BusinessModeManager:
                     pass
 
     # ------------------------------------------------------------------
+    # Screening, local enforcement, and owner alerts.
+    # ------------------------------------------------------------------
+
+    def _chat_control(self, conn_id: str, customer_chat_id: str) -> Optional[Dict[str, Any]]:
+        control = self._db.get_telegram_business_chat_control(conn_id, customer_chat_id)
+        if (
+            control
+            and control.get("enforcement_state") == "temp_block"
+            and control.get("blocked_until") is not None
+            and float(control["blocked_until"]) <= time.time()
+        ):
+            self._db.clear_telegram_business_chat_control(
+                conn_id, customer_chat_id, actor="temp_block_expired"
+            )
+            if control.get("last_risk_event_id"):
+                self._db.resolve_telegram_business_risk_event(control["last_risk_event_id"])
+            control = self._db.get_telegram_business_chat_control(conn_id, customer_chat_id)
+        return control
+
+    def _chat_suppressed(
+        self, conn: Dict[str, Any], customer_chat_id: str
+    ) -> bool:
+        if str(customer_chat_id) in (conn.get("paused_chats") or []):
+            return True
+        control = self._chat_control(conn["connection_id"], customer_chat_id)
+        if not control:
+            return False
+        return control.get("screening_state") in {"risk_hold", "manual_pause"} or control.get(
+            "enforcement_state"
+        ) in {"temp_block", "blocked"}
+
+    def _cancel_chat_buffer(self, key: str) -> None:
+        prior = self._debounce_tasks.pop(key, None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+        self._debounce_buffers.pop(key, None)
+
+    async def _apply_screening_result(
+        self,
+        *,
+        buf: Dict[str, Any],
+        result: ScreeningResult,
+        alert_if_suppressed: bool = True,
+    ) -> None:
+        """Persist a finding and apply the local enforcement policy."""
+        if result.action == "allow":
+            return
+
+        high_confidence = (
+            result.action == "hold"
+            and result.severity == "high"
+            and result.confidence >= self._risk_confidence_threshold
+            and self._auto_temp_block
+        )
+        enforcement = "temp_block" if high_confidence else "none"
+        decision = "temp_block" if enforcement == "temp_block" else "risk_hold"
+        prior = self._chat_control(buf["conn_id"], buf["customer_chat_id"])
+        prior_suppressed = bool(
+            prior
+            and (
+                prior.get("screening_state") in {"risk_hold", "manual_pause"}
+                or prior.get("enforcement_state") in {"temp_block", "blocked"}
+            )
+        )
+        event_id = self._db.create_telegram_business_risk_event(
+            connection_id=buf["conn_id"],
+            customer_chat_id=buf["customer_chat_id"],
+            customer_msg_id=buf.get("customer_msg_id") or None,
+            category=result.category,
+            severity=result.severity,
+            risk_score=result.risk_score,
+            confidence=result.confidence,
+            rule_hits=list(result.rule_hits),
+            result_json=result.as_dict(),
+            message_excerpt=buf["customer_text"],
+            content_hash=content_hash(buf["customer_text"]),
+            decision=decision,
+        )
+
+        if result.action in {"hold", "review"}:
+            blocked_until = time.time() + self._temp_block_seconds if enforcement == "temp_block" else None
+            self._db.set_telegram_business_chat_control(
+                buf["conn_id"],
+                buf["customer_chat_id"],
+                screening_state="risk_hold",
+                enforcement_state=enforcement,
+                blocked_until=blocked_until,
+                reason_code=result.category,
+                source=result.source,
+                last_risk_event_id=event_id,
+            )
+            self._db.block_pending_telegram_business_drafts(
+                buf["conn_id"], buf["customer_chat_id"]
+            )
+
+        if alert_if_suppressed and (not prior_suppressed or result.action == "review"):
+            try:
+                await self._send(
+                    chat_id=int(buf["owner_chat_id"]),
+                    text=self._render_risk_alert(
+                        customer_name=buf["customer_name"],
+                        customer_chat_id=buf["customer_chat_id"],
+                        result=result,
+                        excerpt=buf["customer_text"],
+                        enforcement=enforcement,
+                    ),
+                    reply_markup=self._build_risk_keyboard(event_id),
+                    disable_notification=False,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.debug("Risk alert send failed", exc_info=True)
+
+    async def _classify_message(
+        self, text: str, rules: ScreeningResult, *, allowlisted: bool = False
+    ) -> ScreeningResult:
+        if not self._screening_enabled or self._risk_classifier is None:
+            result = rules
+        else:
+            raw = await self._risk_classifier(text)
+            result = combine_results(
+                rules,
+                raw,
+                risk_threshold=self._risk_threshold,
+                confidence_threshold=self._risk_confidence_threshold,
+            )
+        hard_hits = {
+            "phishing_login", "secret_request", "urgent_payment", "guaranteed_return"
+        }
+        if allowlisted and result.category in {"advertising", "spam"} and not (
+            set(result.rule_hits) & hard_hits
+        ):
+            return replace(result, action="allow")
+        return result
+
+    @staticmethod
+    def _render_risk_alert(
+        *,
+        customer_name: str,
+        customer_chat_id: str,
+        result: ScreeningResult,
+        excerpt: str,
+        enforcement: str,
+    ) -> str:
+        if enforcement == "temp_block":
+            state = "Temporary local block applied."
+        elif result.action in {"hold", "review"}:
+            state = "Drafting paused for this conversation."
+        else:
+            state = "This message was held for review; no draft was created."
+        reasons = "; ".join(result.reasons[:3]) or "The content matched risk signals."
+        return (
+            "⚠️ Business message risk alert\n\n"
+            f"Customer: {customer_name} ({customer_chat_id})\n"
+            f"Category: {result.category} · {result.severity}\n"
+            f"Score: {result.risk_score:.2f} · confidence: {result.confidence:.2f}\n"
+            f"Reasons: {reasons}\n\n"
+            f"Message excerpt:\n{_quote_block(excerpt, max_len=600)}\n\n"
+            f"{state}"
+        )
+
+    @staticmethod
+    def _build_risk_keyboard(event_id: int):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "Resume", callback_data=f"{RISK_CALLBACK_PREFIX}{RISK_RESUME}:{event_id}"
+                ),
+                InlineKeyboardButton(
+                    "Block 24h", callback_data=f"{RISK_CALLBACK_PREFIX}{RISK_TEMP_BLOCK}:{event_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Block", callback_data=f"{RISK_CALLBACK_PREFIX}{RISK_BLOCK}:{event_id}"
+                ),
+                InlineKeyboardButton(
+                    "Mark safe", callback_data=f"{RISK_CALLBACK_PREFIX}{RISK_ALLOW}:{event_id}"
+                ),
+            ],
+        ])
+
+    # ------------------------------------------------------------------
     # business_message updates (customer talks to owner).
     # ------------------------------------------------------------------
 
@@ -250,7 +459,7 @@ class BusinessModeManager:
         customer_chat_id = getattr(chat, "id", None)
         if customer_chat_id is None:
             return
-        if str(customer_chat_id) in (conn.get("paused_chats") or []):
+        if self._chat_suppressed(conn, str(customer_chat_id)):
             logger.debug("Customer chat %s paused; skipping draft", customer_chat_id)
             return
 
@@ -264,6 +473,25 @@ class BusinessModeManager:
             text = text[: self._max_customer_text_chars]
 
         key = f"{conn_id}:{customer_chat_id}"
+
+        # High-confidence rules stop the conversation before the debounce
+        # timer can produce a draft.  Softer findings travel with the buffer
+        # and are combined with the LLM result at fire time.
+        rules = scan_keywords(text) if self._screening_enabled else ScreeningResult()
+        if rules.action == "hold":
+            self._cancel_chat_buffer(key)
+            await self._apply_screening_result(
+                buf={
+                    "conn_id": str(conn_id),
+                    "owner_chat_id": str(conn.get("owner_chat_id")),
+                    "customer_chat_id": str(customer_chat_id),
+                    "customer_msg_id": str(getattr(message, "message_id", "") or ""),
+                    "customer_text": text,
+                    "customer_name": _customer_display_name(message),
+                },
+                result=rules,
+            )
+            return
 
         # Cancel any in-flight debounce for this (connection, customer chat) so
         # rapid bursts coalesce into a single draft against the latest text.
@@ -279,6 +507,7 @@ class BusinessModeManager:
             "customer_msg_id": str(getattr(message, "message_id", "") or ""),
             "customer_text": text,
             "customer_name": _customer_display_name(message),
+            "screening_rules": rules,
         }
 
         # Schedule the actual draft.  If debounce is zero (test mode), fire
@@ -310,7 +539,43 @@ class BusinessModeManager:
         conn = self._db.get_telegram_business_connection(buf["conn_id"])
         if not conn or not conn.get("is_enabled") or not conn.get("auto_draft", True):
             return
-        if buf["customer_chat_id"] in (conn.get("paused_chats") or []):
+        if self._chat_suppressed(conn, buf["customer_chat_id"]):
+            return
+
+        control = self._chat_control(buf["conn_id"], buf["customer_chat_id"])
+        allowlisted = bool(control and control.get("enforcement_state") == "allowlisted")
+        try:
+            screening = await self._classify_message(
+                buf["customer_text"],
+                buf.get("screening_rules") or scan_keywords(buf["customer_text"]),
+                allowlisted=allowlisted,
+            )
+        except Exception as exc:
+            logger.warning("Business-mode message screening failed: %s", exc)
+            try:
+                await self._send(
+                    chat_id=int(buf["owner_chat_id"]),
+                    text=(
+                        "⚠️ I couldn't screen a message from "
+                        f"{buf['customer_name']}. No draft was created.\n\n"
+                        f"Their message was:\n\n{_quote_block(buf['customer_text'])}"
+                    ),
+                    disable_notification=True,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            return
+
+        # Re-read the durable state after the classifier call.  An owner may
+        # have blocked the chat while the model was running.
+        conn = self._db.get_telegram_business_connection(buf["conn_id"])
+        if not conn or not conn.get("is_enabled") or not conn.get("auto_draft", True):
+            return
+        if self._chat_suppressed(conn, buf["customer_chat_id"]):
+            return
+        if screening.action != "allow":
+            await self._apply_screening_result(buf=buf, result=screening)
             return
 
         try:
@@ -338,6 +603,14 @@ class BusinessModeManager:
             logger.debug("Empty draft for %s — skipping", key)
             return
 
+        # The owner or another update may have changed the chat state while
+        # the draft model was running.  Never persist a draft after a hold.
+        conn = self._db.get_telegram_business_connection(buf["conn_id"])
+        if not conn or not conn.get("is_enabled") or not conn.get("auto_draft", True):
+            return
+        if self._chat_suppressed(conn, buf["customer_chat_id"]):
+            return
+
         draft_id = self._db.create_telegram_business_draft(
             connection_id=buf["conn_id"],
             owner_chat_id=buf["owner_chat_id"],
@@ -347,6 +620,8 @@ class BusinessModeManager:
             draft_text=draft_text,
             ttl_seconds=self._draft_ttl_seconds,
         )
+        if not draft_id:
+            return
 
         owner_message = self._render_draft_owner_message(
             customer_name=buf["customer_name"],
@@ -377,6 +652,97 @@ class BusinessModeManager:
     # Inline-button callback dispatch (bd:choice:draft_id)
     # ------------------------------------------------------------------
 
+    async def _handle_risk_callback(
+        self,
+        *,
+        data: str,
+        caller_user_id: Optional[str],
+        answer: Callable[..., Awaitable[Any]],
+        edit_message_text: Callable[..., Awaitable[Any]],
+    ) -> bool:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await answer(text="Invalid risk action.")
+            return True
+        action = parts[1]
+        try:
+            event_id = int(parts[2])
+        except ValueError:
+            await answer(text="Invalid risk action.")
+            return True
+
+        event = self._db.get_telegram_business_risk_event(event_id)
+        if event is None:
+            await answer(text="That risk event has expired.")
+            return True
+        conn = self._db.get_telegram_business_connection(event["connection_id"])
+        if not conn or str(caller_user_id) != str(conn.get("owner_user_id")):
+            await answer(text="⛔ Only the connected account owner can manage this chat.")
+            return True
+
+        connection_id = event["connection_id"]
+        customer_chat_id = event["customer_chat_id"]
+        if action == RISK_RESUME:
+            self._db.clear_telegram_business_chat_control(
+                connection_id, customer_chat_id, actor="owner_callback"
+            )
+            message = "▶ Drafting resumed for this chat. New messages will be screened."
+        elif action == RISK_TEMP_BLOCK:
+            self._db.set_telegram_business_chat_control(
+                connection_id,
+                customer_chat_id,
+                screening_state="risk_hold",
+                enforcement_state="temp_block",
+                blocked_until=time.time() + self._temp_block_seconds,
+                reason_code=event.get("category") or "risk",
+                source="owner_callback",
+                last_risk_event_id=event_id,
+            )
+            self._db.block_pending_telegram_business_drafts(connection_id, customer_chat_id)
+            message = "⏱ Temporary local block applied."
+        elif action == RISK_BLOCK:
+            self._db.set_telegram_business_chat_control(
+                connection_id,
+                customer_chat_id,
+                screening_state="risk_hold",
+                enforcement_state="blocked",
+                blocked_until=None,
+                reason_code=event.get("category") or "risk",
+                source="owner_callback",
+                last_risk_event_id=event_id,
+            )
+            self._db.block_pending_telegram_business_drafts(connection_id, customer_chat_id)
+            message = "⛔ Permanent local block applied."
+        elif action == RISK_ALLOW:
+            self._db.set_telegram_business_chat_control(
+                connection_id,
+                customer_chat_id,
+                screening_state="active",
+                enforcement_state="allowlisted",
+                blocked_until=None,
+                reason_code="owner_allowlist",
+                source="owner_callback",
+                last_risk_event_id=event_id,
+            )
+            message = "✅ Chat marked safe. Advertising and spam thresholds are relaxed; hard risk rules still apply."
+        else:
+            await answer(text="Unknown risk action.")
+            return True
+
+        self._db.set_telegram_business_risk_event_actor(
+            event_id, f"owner:{conn.get('owner_user_id')}"
+        )
+        self._db.resolve_telegram_business_risk_event(event_id)
+        await answer(text=message[:200])
+        try:
+            await edit_message_text(
+                text=f"{message}\n\nChat: {customer_chat_id}",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        return True
+
     async def handle_callback(
         self,
         *,
@@ -390,6 +756,13 @@ class BusinessModeManager:
         Returns True if the callback was dispatched (caller should stop
         further handling), False if it wasn't ours.
         """
+        if data.startswith(RISK_CALLBACK_PREFIX):
+            return await self._handle_risk_callback(
+                data=data,
+                caller_user_id=caller_user_id,
+                answer=answer,
+                edit_message_text=edit_message_text,
+            )
         if not data.startswith(CALLBACK_PREFIX):
             return False
 
@@ -424,6 +797,10 @@ class BusinessModeManager:
             return True
         if str(caller_user_id) != str(conn.get("owner_user_id")):
             await answer(text="⛔ Only the connected account owner can use these buttons.")
+            return True
+
+        if self._chat_suppressed(conn, draft["customer_chat_id"]):
+            await answer(text="This chat is blocked or paused. Resume it before sending.")
             return True
 
         if choice == CHOICE_DISCARD:
@@ -537,6 +914,16 @@ class BusinessModeManager:
         conn = self._db.get_telegram_business_connection(draft["connection_id"])
         if not conn:
             return True
+        if self._chat_suppressed(conn, draft["customer_chat_id"]):
+            try:
+                await self._send(
+                    chat_id=int(owner_chat_id),
+                    text="This chat is blocked or paused. Resume it before sending an edited reply.",
+                    disable_notification=False,
+                )
+            except Exception:
+                pass
+            return True
         if not conn.get("can_reply"):
             try:
                 await self._send(
@@ -612,6 +999,93 @@ class BusinessModeManager:
             return self._render_status(connections=connections, owner_chat_id=owner_chat_id)
 
         sub = args[0].lower()
+        if sub == "risk":
+            if len(args) == 1 or args[1].lower() == "list":
+                return self._render_risk_status(
+                    connections=connections,
+                    controls=self._db.list_telegram_business_chat_controls(
+                        connection_ids=[c["connection_id"] for c in connections]
+                    ),
+                )
+            if len(args) >= 3:
+                nested = args[1].lower()
+                mapped = {"resume": "unblock"}.get(nested, nested)
+                if mapped in {"block", "unblock", "tempblock", "allow", "unallow"}:
+                    return await self.handle_biz_command(
+                        owner_user_id=owner_user_id,
+                        owner_chat_id=owner_chat_id,
+                        args=[mapped, *args[2:]],
+                    )
+            return (
+                "Usage:\n"
+                "  /biz risk list\n"
+                "  /biz risk resume <chat_id>\n"
+                "  /biz risk block <chat_id>\n"
+                "  /biz risk tempblock <chat_id> <minutes>\n"
+                "  /biz risk allow <chat_id>\n"
+                "  /biz risk unallow <chat_id>\n"
+            )
+
+        if sub in {"block", "tempblock", "unblock", "allow", "unallow"}:
+            chat_arg = args[1].strip() if len(args) >= 2 else ""
+            if not chat_arg:
+                return f"Usage: /biz {sub} <chat_id>"
+            if not active:
+                return "You don't have any active business connections."
+            seconds = self._temp_block_seconds
+            if sub == "tempblock":
+                try:
+                    minutes = max(1, min(60 * 24 * 30, int(args[2])))
+                except (IndexError, ValueError):
+                    return "Usage: /biz tempblock <chat_id> <minutes>"
+                seconds = minutes * 60.0
+            changed = 0
+            for conn in active:
+                conn_id = conn["connection_id"]
+                existing = self._db.get_telegram_business_chat_control(conn_id, chat_arg)
+                if sub == "unblock":
+                    if existing and existing.get("enforcement_state") in {"blocked", "temp_block"}:
+                        self._db.clear_telegram_business_chat_control(
+                            conn_id, chat_arg, actor="owner_command"
+                        )
+                        if existing.get("last_risk_event_id"):
+                            self._db.resolve_telegram_business_risk_event(
+                                existing["last_risk_event_id"]
+                            )
+                        changed += 1
+                elif sub == "allow":
+                    self._db.set_telegram_business_chat_control(
+                        conn_id, chat_arg, screening_state="active",
+                        enforcement_state="allowlisted", blocked_until=None,
+                        reason_code="owner_allowlist", source="owner_command",
+                    )
+                    changed += 1
+                elif sub == "unallow":
+                    if existing and existing.get("enforcement_state") == "allowlisted":
+                        self._db.clear_telegram_business_chat_control(
+                            conn_id, chat_arg, actor="owner_command"
+                        )
+                        changed += 1
+                else:
+                    enforcement = "blocked" if sub == "block" else "temp_block"
+                    self._db.set_telegram_business_chat_control(
+                        conn_id, chat_arg, screening_state="risk_hold",
+                        enforcement_state=enforcement,
+                        blocked_until=(time.time() + seconds if enforcement == "temp_block" else None),
+                        reason_code="owner_command", source="owner_command",
+                    )
+                    self._db.block_pending_telegram_business_drafts(conn_id, chat_arg)
+                    changed += 1
+            if sub == "unblock":
+                return f"▶ Unblocked chat {chat_arg}. New messages will be screened."
+            if sub == "allow":
+                return f"✅ Chat {chat_arg} added to the local allowlist."
+            if sub == "unallow":
+                return f"✅ Chat {chat_arg} removed from the local allowlist."
+            if sub == "tempblock":
+                return f"⏱ Chat {chat_arg} locally blocked for {int(seconds / 60)} minute(s)."
+            return f"⛔ Chat {chat_arg} permanently blocked locally."
+
         if sub in {"pause", "resume"}:
             target = (sub == "resume")
             if not active:
@@ -653,7 +1127,12 @@ class BusinessModeManager:
             "  /biz pause       — pause drafting (still see messages)\n"
             "  /biz resume      — resume drafting\n"
             "  /biz off <id>    — mute drafting for one customer chat\n"
-            "  /biz on  <id>    — re-enable drafting for one customer chat"
+            "  /biz on  <id>    — re-enable drafting for one customer chat\n"
+            "  /biz block <id>  — permanently block a chat locally\n"
+            "  /biz unblock <id> — unblock a chat locally\n"
+            "  /biz tempblock <id> <minutes>\n"
+            "  /biz allow <id>  — add a chat to the local allowlist\n"
+            "  /biz risk list   — show risk-held and blocked chats"
         )
 
     # ------------------------------------------------------------------
@@ -680,6 +1159,7 @@ class BusinessModeManager:
             "edited": "✓ Sent (edited)",
             "discarded": "✕ Discarded",
             "expired": "⏰ Expired",
+            "risk_blocked": "⚠️ Blocked by risk screening",
             "awaiting_edit": "✎ Edit",
         }.get(status, status)
         return (
@@ -710,6 +1190,34 @@ class BusinessModeManager:
         lines.append(
             "Commands: /biz pause · /biz resume · /biz off <chat_id> · /biz on <chat_id>"
         )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_risk_status(
+        *, connections: List[Dict[str, Any]], controls: List[Dict[str, Any]]
+    ) -> str:
+        active_ids = {c["connection_id"] for c in connections if c.get("is_enabled")}
+        visible = [
+            row for row in controls
+            if row["connection_id"] in active_ids
+            and (
+                row.get("screening_state") != "active"
+                or row.get("enforcement_state") not in {"none", "allowlisted"}
+            )
+        ]
+        if not visible:
+            return "✅ No risk-held or locally blocked chats."
+        lines = ["📋 Risk chat status\n"]
+        for row in visible:
+            blocked_until = row.get("blocked_until")
+            expiry = f" until {int(blocked_until)}" if blocked_until else ""
+            lines.append(
+                f"• chat {row['customer_chat_id']} · "
+                f"{row.get('screening_state')} · {row.get('enforcement_state')}{expiry} · "
+                f"reason: {row.get('reason_code') or 'unknown'}"
+            )
+        lines.append("")
+        lines.append("Use /biz unblock <chat_id> or /biz allow <chat_id> to restore handling.")
         return "\n".join(lines)
 
     @staticmethod
