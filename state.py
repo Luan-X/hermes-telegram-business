@@ -14,7 +14,8 @@ Hermes' core ``state.db`` schema:
     or when it expires.
 
   business_chat_controls — durable per-chat screening and enforcement state.
-  business_risk_events — append-only screening and owner-action audit trail.
+  business_risk_events — screening and owner-action audit trail subject to
+    the configured retention window.
 """
 
 from __future__ import annotations
@@ -106,9 +107,18 @@ class BusinessStateDB:
 
     def __init__(self, db_path: Path) -> None:
         db_path = Path(db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Customer messages, drafts, chat IDs, and risk excerpts are sensitive
+        # at rest. Enforce private permissions on both the directory and DB;
+        # this also repairs files created under a permissive process umask.
+        db_path.parent.chmod(0o700)
+        if db_path.is_symlink():
+            raise ValueError("Telegram Business state database must not be a symlink")
+        if db_path.exists():
+            db_path.chmod(0o600)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        db_path.chmod(0o600)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
@@ -518,7 +528,8 @@ class BusinessStateDB:
         now = time.time()
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM business_drafts WHERE draft_id = ? AND status = 'pending'",
+                "SELECT * FROM business_drafts WHERE draft_id = ? "
+                "AND status IN ('pending', 'sending', 'awaiting_edit')",
                 (int(draft_id),),
             ).fetchone()
             if row is None:
@@ -531,6 +542,57 @@ class BusinessStateDB:
             )
             self._conn.commit()
             return dict(row)
+
+    def claim_telegram_business_draft_for_send(
+        self, draft_id: int, *, now: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim a live pending draft for one outbound send."""
+        cutoff = now if now is not None else time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM business_drafts WHERE draft_id = ? AND status = 'pending'",
+                (int(draft_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            if float(row["expires_at"]) <= cutoff:
+                self._conn.execute(
+                    "UPDATE business_drafts SET status = 'expired', updated_at = ? "
+                    "WHERE draft_id = ? AND status = 'pending'",
+                    (cutoff, int(draft_id)),
+                )
+                self._conn.commit()
+                return None
+            self._conn.execute(
+                "UPDATE business_drafts SET status = 'sending', updated_at = ? "
+                "WHERE draft_id = ? AND status = 'pending'",
+                (cutoff, int(draft_id)),
+            )
+            self._conn.commit()
+            return dict(row)
+
+    def release_telegram_business_draft_send(self, draft_id: int) -> bool:
+        """Return a failed send claim to pending, if it is still owned."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE business_drafts SET status = 'pending', updated_at = ? "
+                "WHERE draft_id = ? AND status = 'sending'",
+                (time.time(), int(draft_id)),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def mark_telegram_business_draft_awaiting_edit(self, draft_id: int) -> bool:
+        """Reserve a pending draft for the owner's one-message edit flow."""
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE business_drafts SET status = 'awaiting_edit', updated_at = ? "
+                "WHERE draft_id = ? AND status = 'pending' AND expires_at > ?",
+                (now, int(draft_id), now),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
 
     def get_pending_telegram_business_drafts_for_owner(
         self, owner_chat_id: str
@@ -548,8 +610,49 @@ class BusinessStateDB:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE business_drafts SET status = 'expired', updated_at = ? "
-                "WHERE status = 'pending' AND expires_at < ?",
+                "WHERE status IN ('pending', 'awaiting_edit') AND expires_at < ?",
                 (cutoff, cutoff),
             )
+            stale_send = self._conn.execute(
+                "UPDATE business_drafts SET status = 'expired', updated_at = ? "
+                "WHERE status = 'sending' AND updated_at < ?",
+                (cutoff, cutoff - 300.0),
+            )
             self._conn.commit()
-            return int(cur.rowcount)
+            return int(cur.rowcount) + int(stale_send.rowcount)
+
+    def purge_telegram_business_data(
+        self, *, older_than_seconds: float, now: Optional[float] = None
+    ) -> int:
+        """Delete old message-bearing records outside active draft workflows."""
+        cutoff = (now if now is not None else time.time()) - max(0.0, float(older_than_seconds))
+        with self._lock:
+            drafts = self._conn.execute(
+                "DELETE FROM business_drafts "
+                "WHERE status IN ('sent', 'edited', 'discarded', 'expired', 'risk_blocked', 'superseded', 'sending') "
+                "AND updated_at < ?",
+                (cutoff,),
+            )
+            events = self._conn.execute(
+                "DELETE FROM business_risk_events "
+                "WHERE created_at < ?",
+                (cutoff,),
+            )
+            controls = self._conn.execute(
+                "DELETE FROM business_chat_controls "
+                "WHERE connection_id NOT IN (SELECT connection_id FROM business_connections) "
+                "OR connection_id IN ("
+                "SELECT connection_id FROM business_connections "
+                "WHERE is_enabled = 0 AND updated_at < ?"
+                ")",
+                (cutoff,),
+            )
+            connections = self._conn.execute(
+                "DELETE FROM business_connections WHERE is_enabled = 0 AND updated_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return (
+                int(drafts.rowcount) + int(events.rowcount)
+                + int(controls.rowcount) + int(connections.rowcount)
+            )

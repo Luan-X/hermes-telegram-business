@@ -93,6 +93,7 @@ plugins:
       risk_confidence_threshold: 0.60
       auto_temp_block: true
       temp_block_minutes: 1440
+      data_retention_days: 30
       debounce_seconds: 8
       draft_ttl_hours: 24
 ```
@@ -101,7 +102,7 @@ Screening and drafting use the active Hermes model through the host-owned `ctx.l
 
 ## State and Limits
 
-The plugin owns `$HERMES_HOME/telegram-business/state.db`. It stores Business connections, drafts, chat controls, and risk events without changing Hermes core state.
+The plugin owns `$HERMES_HOME/telegram-business/state.db`. It stores Business connections, drafts, chat controls, and risk events without changing Hermes core state. The state directory is private (`0700`) and the database is private (`0600`); on startup or update handling, message-bearing records, risk events, and ended-connection metadata older than `data_retention_days` (30 by default) are purged. Keep the profile directory and its backups private.
 
 Media without a caption is skipped in v1. Conversation history is not added to the draft context, and local blocks do not change Telegram account-level contact status.
 

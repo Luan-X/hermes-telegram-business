@@ -145,3 +145,36 @@ async def test_risk_callback_is_owner_scoped(db):
     )
     assert "Only the connected account owner" in answers[-1]["text"]
     assert db.get_telegram_business_chat_control("conn-risk", "200") is None
+
+
+@pytest.mark.asyncio
+async def test_resolved_risk_callback_is_rejected(db):
+    db.upsert_telegram_business_connection(
+        connection_id="conn-risk", owner_user_id="42", owner_chat_id="100",
+        can_reply=True, is_enabled=True,
+    )
+    event_id = db.create_telegram_business_risk_event(
+        connection_id="conn-risk", customer_chat_id="200", customer_msg_id="1",
+        category="scam", severity="high", risk_score=0.9, confidence=0.9,
+        rule_hits=["secret_request"], result_json={}, message_excerpt="otp",
+        content_hash="hash", decision="temp_block",
+    )
+    db.resolve_telegram_business_risk_event(event_id)
+    manager = BusinessModeManager(
+        session_db=db, send_message=_Sender(),
+        draft_generator=lambda *_: None, debounce_seconds=0,
+    )
+    answers = []
+
+    async def answer(**kwargs):
+        answers.append(kwargs)
+
+    async def edit(**kwargs):
+        return None
+
+    await manager.handle_callback(
+        data=f"br:block:{event_id}", caller_user_id="42",
+        answer=answer, edit_message_text=edit,
+    )
+    assert "already been resolved" in answers[-1]["text"]
+    assert db.get_telegram_business_chat_control("conn-risk", "200") is None

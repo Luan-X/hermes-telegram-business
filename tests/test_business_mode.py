@@ -169,6 +169,57 @@ class TestBusinessDraftLifecycle:
         with pytest.raises(ValueError):
             db.resolve_telegram_business_draft(did, status="bogus")
 
+    def test_send_claim_is_single_use_and_can_be_released(self, db):
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello",
+        )
+        claimed = db.claim_telegram_business_draft_for_send(did)
+        assert claimed is not None
+        assert db.get_telegram_business_draft(did)["status"] == "sending"
+        assert db.claim_telegram_business_draft_for_send(did) is None
+        assert db.release_telegram_business_draft_send(did) is True
+        assert db.get_telegram_business_draft(did)["status"] == "pending"
+
+    def test_expired_send_claim_cannot_be_sent(self, db):
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello",
+            ttl_seconds=60.0,
+        )
+        expires_at = db.get_telegram_business_draft(did)["expires_at"]
+        assert db.claim_telegram_business_draft_for_send(now=expires_at + 1) is None
+        assert db.get_telegram_business_draft(did)["status"] == "expired"
+
+    def test_stale_send_claim_is_expired(self, db):
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello",
+        )
+        assert db.claim_telegram_business_draft_for_send(did) is not None
+        old = time.time() - 301
+        db._conn.execute(
+            "UPDATE business_drafts SET updated_at = ? WHERE draft_id = ?",
+            (old, did),
+        )
+        db._conn.commit()
+        assert db.expire_telegram_business_drafts() == 1
+        assert db.get_telegram_business_draft(did)["status"] == "expired"
+
+    def test_retention_purges_only_old_resolved_rows(self, db):
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello",
+        )
+        db.resolve_telegram_business_draft(did, status="discarded")
+        db._conn.execute(
+            "UPDATE business_drafts SET updated_at = ? WHERE draft_id = ?",
+            (time.time() - 100, did),
+        )
+        db._conn.commit()
+        assert db.purge_telegram_business_data(older_than_seconds=60) == 1
+        assert db.get_telegram_business_draft(did) is None
+
     def test_owner_message_id_round_trip(self, db):
         did = db.create_telegram_business_draft(
             connection_id="c1", owner_chat_id="100", customer_chat_id="200",
@@ -428,6 +479,8 @@ class TestBusinessMessageDraftFlow:
         await mgr.handle_business_message(_fake_business_message(text="Hi"))
         assert sender.calls
         assert "couldn't draft" in sender.calls[0]["text"]
+        assert "model boom" not in sender.calls[0]["text"]
+        assert "No draft was created" in sender.calls[0]["text"]
 
     @pytest.mark.asyncio
     async def test_debounce_coalesces_burst(self, db):
@@ -516,6 +569,32 @@ class TestCallbackDispatch:
         )
         assert answered and "expired" in answered[0]["text"].lower()
         # No customer-chat sends.
+        assert not any(c.get("chat_id") == 200 for c in sender.calls)
+
+    @pytest.mark.asyncio
+    async def test_callback_rejects_expired_draft(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        did = db.create_telegram_business_draft(
+            connection_id="conn1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="old", customer_text="old", draft_text="old reply",
+        )
+        db._conn.execute(
+            "UPDATE business_drafts SET expires_at = ? WHERE draft_id = ?",
+            (time.time() - 1, did),
+        )
+        db._conn.commit()
+        answered: List[Dict[str, Any]] = []
+
+        async def _answer(**kw): answered.append(kw)
+        async def _edit(**kw): pass
+
+        await mgr.handle_callback(
+            data=f"bd:send:{did}", caller_user_id="42",
+            answer=_answer, edit_message_text=_edit,
+        )
+        assert answered and "expired" in answered[0]["text"].lower()
+        assert db.get_telegram_business_draft(did)["status"] == "expired"
         assert not any(c.get("chat_id") == 200 for c in sender.calls)
 
     @pytest.mark.asyncio
@@ -660,6 +739,15 @@ class TestBizCommand:
         )
         assert "active" in reply
         assert "drafting ON" in reply
+
+    @pytest.mark.asyncio
+    async def test_biz_command_rejects_non_owner_chat(self, db):
+        mgr, _ = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        reply = await mgr.handle_biz_command(
+            owner_user_id="42", owner_chat_id="999", args=[],
+        )
+        assert "connected owner's private chat" in reply
 
     @pytest.mark.asyncio
     async def test_pause_and_resume(self, db):

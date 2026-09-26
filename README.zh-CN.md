@@ -93,6 +93,7 @@ plugins:
       risk_confidence_threshold: 0.60
       auto_temp_block: true
       temp_block_minutes: 1440
+      data_retention_days: 30
       debounce_seconds: 8
       draft_ttl_hours: 24
 ```
@@ -101,7 +102,7 @@ plugins:
 
 ## 状态与限制
 
-插件使用 `$HERMES_HOME/telegram-business/state.db` 保存 Business 连接、拟稿、会话控制和风险事件，不修改 Hermes 核心状态。
+插件使用 `$HERMES_HOME/telegram-business/state.db` 保存 Business 连接、拟稿、会话控制和风险事件，不修改 Hermes 核心状态。状态目录权限为 `0700`，数据库权限为 `0600`；插件启动或处理更新时，会清理超过 `data_retention_days`（默认 30 天）的含消息记录、风险事件和已结束连接元数据。请保护 profile 目录及其备份。
 
 v1 会跳过没有说明文字的媒体消息；拟稿上下文不包含完整会话历史；本地拉黑不会改变 Telegram 账号层面的联系人状态。
 

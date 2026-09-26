@@ -139,6 +139,7 @@ class BusinessModeManager:
         risk_confidence_threshold: float = 0.60,
         temp_block_seconds: float = 24.0 * 3600.0,
         auto_temp_block: bool = True,
+        data_retention_days: float = 30.0,
     ) -> None:
         self._db = session_db
         self._send = send_message
@@ -152,6 +153,14 @@ class BusinessModeManager:
         self._risk_confidence_threshold = max(0.0, min(1.0, float(risk_confidence_threshold)))
         self._temp_block_seconds = max(60.0, float(temp_block_seconds))
         self._auto_temp_block = bool(auto_temp_block)
+        self._data_retention_seconds = max(1.0, float(data_retention_days) * 86400.0)
+
+        # Keep unresolved records for active workflows, while bounding the
+        # lifetime of completed message-bearing records in the local DB.
+        self._db.expire_telegram_business_drafts()
+        self._db.purge_telegram_business_data(
+            older_than_seconds=self._data_retention_seconds,
+        )
 
         # In-flight debounce tasks, keyed by (connection_id, customer_chat_id).
         # New customer messages reset the timer so a typing burst yields one draft.
@@ -180,10 +189,7 @@ class BusinessModeManager:
         owner_chat_id = getattr(business_connection, "user_chat_id", None)
         is_enabled = bool(getattr(business_connection, "is_enabled", False))
         if conn_id is None or owner_user_id is None or owner_chat_id is None:
-            logger.warning(
-                "BusinessConnection update missing required fields: id=%s, user.id=%s, user_chat_id=%s",
-                conn_id, owner_user_id, owner_chat_id,
-            )
+            logger.warning("BusinessConnection update missing required fields")
             return
 
         # ``can_reply`` location moved in API 9.0 from connection root to
@@ -213,10 +219,7 @@ class BusinessModeManager:
                     disable_notification=False,
                 )
             except Exception as exc:
-                logger.warning(
-                    "Failed to deliver business-mode onboarding DM to %s: %s",
-                    owner_chat_id, exc,
-                )
+                logger.warning("Failed to deliver business-mode onboarding DM (%s)", type(exc).__name__)
 
         # Connection ended → DM the owner a confirmation.
         if previous is not None and previous.get("is_enabled") and not is_enabled:
@@ -227,7 +230,7 @@ class BusinessModeManager:
                     disable_notification=True,
                 )
             except Exception as exc:
-                logger.debug("Disconnection notice send failed (%s): %s", owner_chat_id, exc)
+                logger.debug("Disconnection notice send failed (%s)", type(exc).__name__)
 
         # can_reply changed → tell the owner.
         if previous is not None and previous.get("is_enabled") and is_enabled:
@@ -357,8 +360,8 @@ class BusinessModeManager:
                     disable_notification=False,
                     disable_web_page_preview=True,
                 )
-            except Exception:
-                logger.debug("Risk alert send failed", exc_info=True)
+            except Exception as exc:
+                logger.debug("Risk alert send failed (%s)", type(exc).__name__)
 
     async def _classify_message(
         self, text: str, rules: ScreeningResult, *, allowlisted: bool = False
@@ -441,18 +444,19 @@ class BusinessModeManager:
         It has ``business_connection_id``, ``chat`` (the customer chat),
         ``from_user`` (the customer), and ``text``/``caption``.
         """
+        self._db.expire_telegram_business_drafts()
         conn_id = getattr(message, "business_connection_id", None)
         if not conn_id:
             return
 
         conn = self._db.get_telegram_business_connection(str(conn_id))
         if not conn:
-            logger.debug("Received business_message for unknown connection %s", conn_id)
+            logger.debug("Received business_message for unknown connection")
             return
         if not conn.get("is_enabled"):
             return
         if not conn.get("auto_draft", True):
-            logger.debug("Business connection %s has auto_draft=False; skipping draft", conn_id)
+            logger.debug("Business connection has auto_draft=False; skipping draft")
             return
 
         chat = getattr(message, "chat", None)
@@ -460,7 +464,7 @@ class BusinessModeManager:
         if customer_chat_id is None:
             return
         if self._chat_suppressed(conn, str(customer_chat_id)):
-            logger.debug("Customer chat %s paused; skipping draft", customer_chat_id)
+            logger.debug("Customer chat is paused; skipping draft")
             return
 
         # Pull text. Captions on media count too — they're often the only
@@ -551,7 +555,7 @@ class BusinessModeManager:
                 allowlisted=allowlisted,
             )
         except Exception as exc:
-            logger.warning("Business-mode message screening failed: %s", exc)
+            logger.warning("Business-mode message screening failed (%s)", type(exc).__name__)
             try:
                 await self._send(
                     chat_id=int(buf["owner_chat_id"]),
@@ -583,13 +587,13 @@ class BusinessModeManager:
                 buf["customer_text"], buf["customer_chat_id"]
             )
         except Exception as exc:
-            logger.exception("Business-mode draft generator failed: %s", exc)
+            logger.error("Business-mode draft generator failed (%s)", type(exc).__name__)
             try:
                 await self._send(
                     chat_id=int(buf["owner_chat_id"]),
                     text=(
                         "⚠️ I couldn't draft a reply to "
-                        f"{buf['customer_name']}: {exc}.\n\n"
+                        f"{buf['customer_name']}. No draft was created.\n\n"
                         f"Their message was:\n\n{buf['customer_text']}"
                     ),
                     disable_notification=True,
@@ -600,7 +604,7 @@ class BusinessModeManager:
 
         draft_text = (draft_text or "").strip()
         if not draft_text:
-            logger.debug("Empty draft for %s — skipping", key)
+            logger.debug("Empty draft — skipping")
             return
 
         # The owner or another update may have changed the chat state while
@@ -638,8 +642,7 @@ class BusinessModeManager:
                 disable_notification=False,
             )
         except Exception as exc:
-            logger.warning("Failed to deliver business-mode draft to owner %s: %s",
-                           buf["owner_chat_id"], exc)
+            logger.warning("Failed to deliver business-mode draft to owner (%s)", type(exc).__name__)
             # Mark the draft expired so we don't leave an unactionable row.
             self._db.resolve_telegram_business_draft(draft_id, status="expired")
             return
@@ -674,6 +677,9 @@ class BusinessModeManager:
         event = self._db.get_telegram_business_risk_event(event_id)
         if event is None:
             await answer(text="That risk event has expired.")
+            return True
+        if event.get("resolved_at") is not None:
+            await answer(text="That risk event has already been resolved.")
             return True
         conn = self._db.get_telegram_business_connection(event["connection_id"])
         if not conn or str(caller_user_id) != str(conn.get("owner_user_id")):
@@ -756,6 +762,7 @@ class BusinessModeManager:
         Returns True if the callback was dispatched (caller should stop
         further handling), False if it wasn't ours.
         """
+        self._db.expire_telegram_business_drafts()
         if data.startswith(RISK_CALLBACK_PREFIX):
             return await self._handle_risk_callback(
                 data=data,
@@ -783,6 +790,10 @@ class BusinessModeManager:
             return True
         if draft.get("status") != "pending":
             await answer(text="That draft has already been resolved.")
+            return True
+        if float(draft.get("expires_at") or 0) <= time.time():
+            self._db.resolve_telegram_business_draft(draft_id, status="expired")
+            await answer(text="That draft has expired.")
             return True
 
         # Only the owner of this connection may act on the buttons. Reject
@@ -816,6 +827,10 @@ class BusinessModeManager:
             return True
 
         if choice == CHOICE_EDIT:
+            if not self._db.mark_telegram_business_draft_awaiting_edit(draft_id):
+                await answer(text="That draft has expired or was already resolved.")
+                return True
+            draft = self._db.get_telegram_business_draft(draft_id) or draft
             self._edit_capture[str(conn["owner_chat_id"])] = draft_id
             await answer(text="✎ Send me the text to deliver")
             try:
@@ -839,6 +854,15 @@ class BusinessModeManager:
                     )
                 )
                 return True
+            claimed = self._db.claim_telegram_business_draft_for_send(draft_id)
+            if claimed is None:
+                latest = self._db.get_telegram_business_draft(draft_id)
+                await answer(
+                    text=("That draft has expired." if not latest or latest.get("status") == "expired"
+                          else "That draft is already being sent or was resolved.")
+                )
+                return True
+            draft = claimed
             try:
                 await self._send(
                     chat_id=int(draft["customer_chat_id"]),
@@ -846,8 +870,9 @@ class BusinessModeManager:
                     business_connection_id=draft["connection_id"],
                 )
             except Exception as exc:
-                logger.warning("Business send failed for draft %s: %s", draft_id, exc)
-                await answer(text=f"⚠️ Send failed: {exc}")
+                logger.warning("Business send failed (%s)", type(exc).__name__)
+                self._db.release_telegram_business_draft_send(draft_id)
+                await answer(text="⚠️ Send failed. Telegram did not accept the message.")
                 return True
 
             self._db.resolve_telegram_business_draft(
@@ -910,6 +935,17 @@ class BusinessModeManager:
             except Exception:
                 pass
             return True
+        if float(draft.get("expires_at") or 0) <= time.time():
+            self._db.resolve_telegram_business_draft(draft_id, status="expired")
+            try:
+                await self._send(
+                    chat_id=int(owner_chat_id),
+                    text="That draft has expired.",
+                    disable_notification=True,
+                )
+            except Exception:
+                pass
+            return True
 
         conn = self._db.get_telegram_business_connection(draft["connection_id"])
         if not conn:
@@ -946,11 +982,11 @@ class BusinessModeManager:
                 business_connection_id=draft["connection_id"],
             )
         except Exception as exc:
-            logger.warning("Business edit-send failed for draft %s: %s", draft_id, exc)
+            logger.warning("Business edit-send failed (%s)", type(exc).__name__)
             try:
                 await self._send(
                     chat_id=int(owner_chat_id),
-                    text=f"⚠️ Send failed: {exc}",
+                    text="⚠️ Send failed. Telegram did not accept the message.",
                     disable_notification=False,
                 )
             except Exception:
@@ -993,6 +1029,11 @@ class BusinessModeManager:
         connections = self._db.list_telegram_business_connections(
             owner_user_id=str(owner_user_id), enabled_only=False,
         )
+        if connections and not any(
+            str(connection.get("owner_chat_id")) == str(owner_chat_id)
+            for connection in connections
+        ):
+            return "⚠️ /biz commands are available only in the connected owner's private chat."
         active = [c for c in connections if c.get("is_enabled")]
 
         if not args:

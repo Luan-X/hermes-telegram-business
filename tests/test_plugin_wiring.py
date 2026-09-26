@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -48,4 +49,8 @@ def test_factory_wires_handlers(tmp_path, monkeypatch):
     assert -1 in groups
 
     # Plugin state DB created under HERMES_HOME, not the core state.db.
-    assert (tmp_path / "telegram-business" / "state.db").exists()
+    state_dir = tmp_path / "telegram-business"
+    state_db = state_dir / "state.db"
+    assert state_db.exists()
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(state_db.stat().st_mode) == 0o600

@@ -93,6 +93,7 @@ plugins:
       risk_confidence_threshold: 0.60
       auto_temp_block: true
       temp_block_minutes: 1440
+      data_retention_days: 30
       debounce_seconds: 8
       draft_ttl_hours: 24
 ```
@@ -101,7 +102,7 @@ plugins:
 
 ## 狀態與限制
 
-外掛使用 `$HERMES_HOME/telegram-business/state.db` 儲存 Business 連線、擬稿、對話控制和風險事件，不修改 Hermes 核心狀態。
+外掛使用 `$HERMES_HOME/telegram-business/state.db` 儲存 Business 連線、擬稿、對話控制和風險事件，不修改 Hermes 核心狀態。狀態目錄權限為 `0700`，資料庫權限為 `0600`；外掛啟動或處理更新時，會清理超過 `data_retention_days`（預設 30 天）的訊息記錄、風險事件和已結束連線中繼資料。請保護 profile 目錄及其備份。
 
 v1 會跳過沒有說明文字的媒體訊息；擬稿上下文不包含完整對話歷史；本地封鎖不會改變 Telegram 帳號層面的聯絡人狀態。
 

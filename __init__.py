@@ -77,7 +77,7 @@ def _hermes_home() -> Path:
         try:
             return Path(get_hermes_home())
         except Exception:  # pragma: no cover - defensive fallback
-            logger.debug("telegram-business: profile home lookup failed", exc_info=True)
+            logger.debug("telegram-business: profile home lookup failed")
     home = os.environ.get("HERMES_HOME")
     return Path(home) if home else Path.home() / ".hermes"
 
@@ -105,7 +105,7 @@ def _plugin_config(ctx: Any) -> dict:
             if isinstance(block, dict):
                 return block
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("telegram-business: config read failed: %s", exc)
+        logger.debug("telegram-business: config read failed (%s)", type(exc).__name__)
     return {}
 
 
@@ -129,6 +129,7 @@ def register(ctx: Any) -> None:
     risk_confidence_threshold = float(cfg.get("risk_confidence_threshold", 0.60))
     temp_block_minutes = float(cfg.get("temp_block_minutes", 24 * 60))
     auto_temp_block = _as_bool(cfg.get("auto_temp_block"), True)
+    data_retention_days = float(cfg.get("data_retention_days", 30.0))
 
     # Deferred singletons — constructed on first connect so import stays light.
     _state: dict = {"db": None, "manager": None}
@@ -212,6 +213,7 @@ def register(ctx: Any) -> None:
             risk_confidence_threshold=risk_confidence_threshold,
             temp_block_seconds=max(60.0, temp_block_minutes * 60.0),
             auto_temp_block=auto_temp_block,
+            data_retention_days=data_retention_days,
         )
         return _state["manager"]
 
@@ -238,7 +240,7 @@ def register(ctx: Any) -> None:
             try:
                 await manager.handle_connection_update(conn)
             except Exception as exc:
-                logger.exception("telegram-business: connection handler failed: %s", exc)
+                logger.error("telegram-business: connection handler failed (%s)", type(exc).__name__)
 
         async def _on_business_message(update, context):
             message = (
@@ -250,7 +252,7 @@ def register(ctx: Any) -> None:
             try:
                 await manager.handle_business_message(message)
             except Exception as exc:
-                logger.exception("telegram-business: message handler failed: %s", exc)
+                logger.error("telegram-business: message handler failed (%s)", type(exc).__name__)
 
         async def _on_draft_button(update, context):
             query = update.callback_query
@@ -265,7 +267,7 @@ def register(ctx: Any) -> None:
                     edit_message_text=query.edit_message_text,
                 )
             except Exception as exc:
-                logger.exception("telegram-business: draft callback failed: %s", exc)
+                logger.error("telegram-business: draft callback failed (%s)", type(exc).__name__)
                 try:
                     await query.answer(text="⚠️ Action failed.")
                 except Exception:
@@ -292,7 +294,7 @@ def register(ctx: Any) -> None:
                     text=getattr(message, "text", "") or "",
                 )
             except Exception as exc:
-                logger.exception("telegram-business: edit capture failed: %s", exc)
+                logger.error("telegram-business: edit capture failed (%s)", type(exc).__name__)
                 consumed = False
             if consumed:
                 raise ApplicationHandlerStop
@@ -303,6 +305,8 @@ def register(ctx: Any) -> None:
                 return
             user = getattr(message, "from_user", None)
             chat = getattr(message, "chat", None)
+            if getattr(chat, "type", None) != "private":
+                return
             text = (getattr(message, "text", "") or "").strip()
             args = text.split()[1:]
             try:
@@ -312,8 +316,8 @@ def register(ctx: Any) -> None:
                     args=args,
                 )
             except Exception as exc:
-                logger.exception("telegram-business: /biz failed: %s", exc)
-                reply = f"⚠️ /biz failed: {exc}"
+                logger.error("telegram-business: /biz failed (%s)", type(exc).__name__)
+                reply = "⚠️ /biz failed. No changes were made."
             try:
                 bot = getattr(adapter, "_bot", None)
                 if bot is not None and chat is not None:
@@ -321,8 +325,8 @@ def register(ctx: Any) -> None:
                         chat_id=chat.id, text=reply,
                         disable_web_page_preview=True,
                     )
-            except Exception:
-                logger.debug("telegram-business: /biz reply send failed", exc_info=True)
+            except Exception as exc:
+                logger.debug("telegram-business: /biz reply send failed (%s)", type(exc).__name__)
 
         # Connection lifecycle (established / edited / ended).
         application.add_handler(BusinessConnectionHandler(_on_business_connection))
