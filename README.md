@@ -41,10 +41,11 @@ Discard → dropped, the customer sees nothing
 ## Install
 
 ```bash
-PROFILE_HOME="${HERMES_HOME:-$HOME/.hermes}"
+PROFILE=dajichat
+PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE"
 git clone https://github.com/NousResearch/hermes-telegram-business \
     "$PROFILE_HOME/plugins/telegram-business"
-hermes plugins enable telegram-business
+hermes -p "$PROFILE" plugins enable telegram-business
 ```
 
 Restart the gateway (`hermes gateway restart`). Then:
@@ -91,7 +92,7 @@ Drafting uses your active Hermes model through the host-owned plugin LLM surface
 
 ## State
 
-Plugin-owned SQLite at `$HERMES_HOME/telegram-business/state.db` (normally `~/.hermes/profiles/<profile>/telegram-business/state.db`; connections, drafts, per-chat controls, and risk events). Hermes' core state is never touched. Delete the file to reset.
+Plugin-owned SQLite at the active profile's `telegram-business/state.db` (for example, `~/.hermes/profiles/dajichat/telegram-business/state.db`; connections, drafts, per-chat controls, and risk events). Hermes' core state is never touched. Delete the file to reset.
 
 ## v1 limits
 
