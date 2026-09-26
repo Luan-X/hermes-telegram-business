@@ -1,6 +1,6 @@
 """Plugin-owned SQLite state for Telegram Business Mode.
 
-Two tables, both living in the plugin's own database file
+Plugin tables live in the plugin's own database file
 (``<HERMES_HOME>/telegram-business/state.db``) — the plugin never touches
 Hermes' core ``state.db`` schema:
 

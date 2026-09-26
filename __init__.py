@@ -62,10 +62,24 @@ _DEFAULT_PERSONA = (
 
 
 def _hermes_home() -> Path:
+    """Return the active profile home, including multiplexed gateway scopes.
+
+    Hermes keeps the active profile in a context-local override while serving
+    multiple profiles from one gateway process. Reading only the process
+    environment would silently route every profile's plugin state to the
+    default ``~/.hermes`` directory.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:  # pragma: no cover - standalone plugin loading
+        get_hermes_home = None
+    if get_hermes_home is not None:
+        try:
+            return Path(get_hermes_home())
+        except Exception:  # pragma: no cover - defensive fallback
+            logger.debug("telegram-business: profile home lookup failed", exc_info=True)
     home = os.environ.get("HERMES_HOME")
-    if home:
-        return Path(home)
-    return Path.home() / ".hermes"
+    return Path(home) if home else Path.home() / ".hermes"
 
 
 def _plugin_config(ctx: Any) -> dict:
