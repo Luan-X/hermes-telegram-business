@@ -1,5 +1,7 @@
 # hermes-telegram-business
 
+[简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+
 Telegram Business secretary plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 It keeps the original owner-approved drafting flow and adds a risk-control layer for incoming Business messages.
